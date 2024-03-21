@@ -28,6 +28,13 @@ The models in this repository are based on the [T5 architecture](https://arxiv.o
 
 ## Usage
 
+```
+python -m venv ./
+source ./bin/activate
+python -m pip install -U pip
+pip install accelerate torch transformers pytest matplotlib pandas
+```
+
 To perform inference with Chronos models, install this package by running:
 
 ```
