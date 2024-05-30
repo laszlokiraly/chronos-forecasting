@@ -7,7 +7,45 @@ from typing import Tuple
 import torch
 import pytest
 
-from chronos import ChronosConfig, ChronosPipeline
+from chronos import ChronosConfig, ChronosPipeline, MeanScaleUniformBins
+
+
+@pytest.mark.parametrize("n_numerical_tokens", [5, 10, 27])
+@pytest.mark.parametrize("n_special_tokens", [2, 5, 13])
+def test_tokenizer_consistency(n_numerical_tokens: int, n_special_tokens: int):
+    n_tokens = n_numerical_tokens + n_special_tokens
+
+    config = ChronosConfig(
+        tokenizer_class="MeanScaleUniformBins",
+        tokenizer_kwargs=dict(low_limit=-1.0, high_limit=1.0),
+        n_tokens=n_tokens,
+        n_special_tokens=n_special_tokens,
+        pad_token_id=0,
+        eos_token_id=1,
+        use_eos_token=True,
+        model_type="seq2seq",
+        context_length=512,
+        prediction_length=64,
+        num_samples=20,
+        temperature=1.0,
+        top_k=50,
+        top_p=1.0,
+    )
+
+    tokenizer = config.create_tokenizer()
+    assert isinstance(tokenizer, MeanScaleUniformBins)
+
+    context = tokenizer.centers.unsqueeze(0)  # add batch dimension
+    scale = torch.ones((1,))  # fix the scale to one to turn off scaling
+
+    token_ids, _, _ = tokenizer._input_transform(context, scale=scale)
+
+    samples = tokenizer.output_transform(
+        token_ids.unsqueeze(1),  # add sample dimension
+        scale=scale,
+    )
+
+    assert (samples[0, 0, :] == context).all()
 
 
 @pytest.mark.xfail
@@ -47,7 +85,7 @@ def test_tokenizer_fixed_data(
     )
     batch_size, _ = context.shape
 
-    token_ids, attention_mask, scale = tokenizer.input_transform(context)
+    token_ids, attention_mask, scale = tokenizer.context_input_transform(context)
 
     assert token_ids.shape == (batch_size, context_length + 1 * use_eos_token)
     assert all(token_ids[:, 0] == torch.tensor([0]).repeat(batch_size))
@@ -59,7 +97,7 @@ def test_tokenizer_fixed_data(
 
     samples = tokenizer.output_transform(
         torch.arange(n_special_tokens, n_tokens).unsqueeze(0).repeat(batch_size, 1, 1),
-        decoding_context=scale,
+        tokenizer_state=scale,
     )
 
     assert (samples[:, 0, [0, -1]] == context).all()
@@ -98,7 +136,7 @@ def test_tokenizer_random_data(use_eos_token: bool):
         ]
     )
 
-    token_ids, attention_mask, scale = tokenizer.input_transform(context)
+    token_ids, attention_mask, scale = tokenizer.context_input_transform(context)
 
     assert token_ids.shape == (
         *context.shape[:-1],
@@ -119,13 +157,13 @@ def test_tokenizer_random_data(use_eos_token: bool):
     assert samples.shape == (2, 10, 4)
 
 
-def validate_samples(samples: torch.Tensor, shape: Tuple[int, int, int]) -> None:
+def validate_tensor(samples: torch.Tensor, shape: Tuple[int, ...]) -> None:
     assert isinstance(samples, torch.Tensor)
     assert samples.shape == shape
 
 
 @pytest.mark.parametrize("torch_dtype", [torch.float32, torch.bfloat16])
-def test_pipeline(torch_dtype: str):
+def test_pipeline_predict(torch_dtype: str):
     pipeline = ChronosPipeline.from_pretrained(
         Path(__file__).parent / "dummy-chronos-model",
         device_map="cpu",
@@ -136,7 +174,7 @@ def test_pipeline(torch_dtype: str):
     # input: tensor of shape (batch_size, context_length)
 
     samples = pipeline.predict(context, num_samples=12, prediction_length=3)
-    validate_samples(samples, (4, 12, 3))
+    validate_tensor(samples, (4, 12, 3))
 
     with pytest.raises(ValueError):
         samples = pipeline.predict(context, num_samples=7, prediction_length=65)
@@ -144,12 +182,12 @@ def test_pipeline(torch_dtype: str):
     samples = pipeline.predict(
         context, num_samples=7, prediction_length=65, limit_prediction_length=False
     )
-    validate_samples(samples, (4, 7, 65))
+    validate_tensor(samples, (4, 7, 65))
 
     # input: batch_size-long list of tensors of shape (context_length,)
 
     samples = pipeline.predict(list(context), num_samples=12, prediction_length=3)
-    validate_samples(samples, (4, 12, 3))
+    validate_tensor(samples, (4, 12, 3))
 
     with pytest.raises(ValueError):
         samples = pipeline.predict(list(context), num_samples=7, prediction_length=65)
@@ -160,12 +198,12 @@ def test_pipeline(torch_dtype: str):
         prediction_length=65,
         limit_prediction_length=False,
     )
-    validate_samples(samples, (4, 7, 65))
+    validate_tensor(samples, (4, 7, 65))
 
     # input: tensor of shape (context_length,)
 
     samples = pipeline.predict(context[0, ...], num_samples=12, prediction_length=3)
-    validate_samples(samples, (1, 12, 3))
+    validate_tensor(samples, (1, 12, 3))
 
     with pytest.raises(ValueError):
         samples = pipeline.predict(context[0, ...], num_samples=7, prediction_length=65)
@@ -176,4 +214,33 @@ def test_pipeline(torch_dtype: str):
         prediction_length=65,
         limit_prediction_length=False,
     )
-    validate_samples(samples, (1, 7, 65))
+    validate_tensor(samples, (1, 7, 65))
+
+
+@pytest.mark.parametrize("torch_dtype", [torch.float32, torch.bfloat16])
+def test_pipeline_embed(torch_dtype: str):
+    pipeline = ChronosPipeline.from_pretrained(
+        Path(__file__).parent / "dummy-chronos-model",
+        device_map="cpu",
+        torch_dtype=torch_dtype,
+    )
+    d_model = pipeline.model.model.config.d_model
+    context = 10 * torch.rand(size=(4, 16)) + 10
+    expected_embed_length = 16 + (1 if pipeline.model.config.use_eos_token else 0)
+
+    # input: tensor of shape (batch_size, context_length)
+
+    embedding, scale = pipeline.embed(context)
+    validate_tensor(embedding, (4, expected_embed_length, d_model))
+    validate_tensor(scale, (4,))
+
+    # input: batch_size-long list of tensors of shape (context_length,)
+
+    embedding, scale = pipeline.embed(list(context))
+    validate_tensor(embedding, (4, expected_embed_length, d_model))
+    validate_tensor(scale, (4,))
+
+    # input: tensor of shape (context_length,)
+    embedding, scale = pipeline.embed(context[0, ...])
+    validate_tensor(embedding, (1, expected_embed_length, d_model))
+    validate_tensor(scale, (1,))
